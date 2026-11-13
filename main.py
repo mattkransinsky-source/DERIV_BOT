@@ -1,0 +1,141 @@
+import os, json, time, threading, requests
+import websocket
+
+DERIV_TOKEN = os.getenv("DERIV_TOKEN")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+SYMBOL = "1HZ100V"  # Volatility 100 (1s) Index
+STAKE = 0.35
+DURATION = 5  # 5 ticks
+MAX_CONSEC_LOSS = 3
+MAX_DAILY_LOSS = 5.0
+
+ticks = []
+balance = 0
+daily_pnl = 0
+consec_loss = 0
+trading_paused_until = 0
+in_trade = False
+
+def send_tg(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(msg)
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+    except Exception as e:
+        print("TG Error:", e)
+
+def get_signal():
+    # Need at least 20 ticks
+    if len(ticks) < 20:
+        return None
+    last_20 = ticks[-20:]
+    last_5 = ticks[-5:]
+    avg_20 = sum(last_20) / len(last_20)
+    avg_5 = sum(last_5) / len(last_5)
+    current = ticks[-1]
+
+    # RISE: price above average + last 5 trending up
+    if current > avg_20 and avg_5 > avg_20 and last_5[-1] > last_5[0]:
+        return "CALL"  # RISE
+    # FALL: price below average + last 5 trending down
+    if current < avg_20 and avg_5 < avg_20 and last_5[-1] < last_5[0]:
+        return "PUT"  # FALL
+    return None
+
+def on_message(ws, message):
+    global balance, daily_pnl, consec_loss, in_trade, trading_paused_until
+    data = json.loads(message)
+
+    if data.get("msg_type") == "authorize":
+        print("Authorized. Balance:", data["authorize"]["balance"])
+        send_tg(f"✅ Deriv Bot Started\nMarket: Volatility 100 (1s)\nStrategy: Rise/Fall Trend Sniper\nStake: ${STAKE} | Duration: {DURATION} ticks")
+        ws.send(json.dumps({"ticks_history": SYMBOL, "count": 50, "end": "latest", "style": "ticks", "subscribe": 1}))
+        ws.send(json.dumps({"balance": 1, "subscribe": 1}))
+        return
+
+    if data.get("msg_type") == "history":
+        global ticks
+        ticks = list(data["history"]["prices"])
+        return
+
+    if data.get("msg_type") == "tick":
+        price = float(data["tick"]["quote"])
+        ticks.append(price)
+        if len(ticks) > 100:
+            ticks.pop(0)
+
+        # Check pause / daily limit
+        if time.time() < trading_paused_until:
+            return
+        if daily_pnl <= -MAX_DAILY_LOSS:
+            send_tg(f"🛑 Daily loss limit hit (-${MAX_DAILY_LOSS}). Bot stopped for today.")
+            trading_paused_until = time.time() + 86400
+            return
+        if in_trade:
+            return
+
+        signal = get_signal()
+        if signal:
+            in_trade = True
+            print(f"Signal {signal} at {price}")
+            ws.send(json.dumps({
+                "buy": 1,
+                "price": STAKE,
+                "parameters": {
+                    "amount": STAKE,
+                    "basis": "stake",
+                    "contract_type": signal,
+                    "currency": "USD",
+                    "duration": DURATION,
+                    "duration_unit": "t",
+                    "symbol": SYMBOL
+                }
+            }))
+        return
+
+    if data.get("msg_type") == "buy":
+        contract_id = data["buy"]["contract_id"]
+        ws.send(json.dumps({"proposal_open_contract": 1, "contract_id": contract_id, "subscribe": 1}))
+        send_tg(f"📈 Trade Placed: {'RISE' if data['buy']['longcode'].find('Rise')!=-1 else 'FALL'} | Stake ${STAKE}")
+        return
+
+    if data.get("msg_type") == "proposal_open_contract":
+        poc = data.get("proposal_open_contract", {})
+        if poc.get("is_sold"):
+            profit = float(poc.get("profit", 0))
+            daily_pnl += profit
+            in_trade = False
+            if profit >= 0:
+                consec_loss = 0
+                send_tg(f"✅ WIN +${profit:.2f} | Daily P&L: ${daily_pnl:.2f}")
+            else:
+                consec_loss += 1
+                send_tg(f"❌ LOSS ${profit:.2f} | Daily P&L: ${daily_pnl:.2f} | Streak: {consec_loss} losses")
+                if consec_loss >= MAX_CONSEC_LOSS:
+                    trading_paused_until = time.time() + 1800  # 30 min pause
+                    consec_loss = 0
+                    send_tg("⏸️ 3 losses in a row. Pausing 30 mins to protect account.")
+        return
+
+    if data.get("msg_type") == "balance":
+        balance = float(data["balance"]["balance"])
+
+def on_open(ws):
+    ws.send(json.dumps({"authorize": DERIV_TOKEN}))
+
+def run():
+    while True:
+        try:
+            ws = websocket.WebSocketApp("wss://ws.derivws.com/websockets/v3?app_id=1089",
+                on_open=on_open, on_message=on_message)
+            ws.run_forever()
+        except Exception as e:
+            print("Reconnect:", e)
+            time.sleep(5)
+
+if __name__ == "__main__":
+    run()
