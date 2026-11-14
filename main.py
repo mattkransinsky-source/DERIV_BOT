@@ -2,7 +2,7 @@ import os, json, time, threading, requests
 import websocket
 from flask import Flask
 
-# --- Flask for Render Web Service ---
+# --- Flask for Render ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -18,14 +18,14 @@ def run_web():
     print(f"Flask on {port}", flush=True)
     app.run(host="0.0.0.0", port=port, threaded=True, use_reloader=False)
 
-# --- Your Deriv Bot - Unchanged Logic ---
+# --- Config ---
 DERIV_TOKEN = os.getenv("DERIV_TOKEN")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-SYMBOL = "1HZ100V"  # Volatility 100 (1s) Index
+SYMBOL = "1HZ100V"
 STAKE = 0.35
-DURATION = 5  # 5 ticks
+DURATION = 5
 MAX_CONSEC_LOSS = 3
 MAX_DAILY_LOSS = 5.0
 
@@ -35,6 +35,11 @@ daily_pnl = 0
 consec_loss = 0
 trading_paused_until = 0
 in_trade = False
+
+ENDPOINTS = [
+    "wss://ws.derivws.com/websockets/v3?app_id=1089",
+    "wss://ws.binaryws.com/websockets/v3?app_id=1089",
+]
 
 def send_tg(msg):
     print(msg, flush=True)
@@ -158,22 +163,32 @@ def on_close(ws, code, msg):
     print(f"WS Closed {code} {msg} - will reconnect", flush=True)
 
 def run_deriv():
-    # Wait a bit so Flask starts first
     time.sleep(3)
     if not DERIV_TOKEN:
-        print("❌ NO DERIV_TOKEN in Env - bot cannot start", flush=True)
+        print("NO DERIV_TOKEN", flush=True)
         send_tg("❌ NO DERIV_TOKEN set in Render Environment. Add it and redeploy.")
         return
+    fail_count = 0
+    endpoint_idx = 0
     while True:
         try:
-            ws = websocket.WebSocketApp("wss://ws.derivws.com/websockets/v3?app_id=1089",
-                on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+            url = ENDPOINTS[endpoint_idx % len(ENDPOINTS)]
+            print(f"Connecting to {url} - attempt {fail_count+1}", flush=True)
+            ws = websocket.WebSocketApp(url,
+                on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close,
+                header=[
+                    "Origin: https://app.deriv.com",
+                    "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+                ])
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
             print(f"Reconnect: {e}", flush=True)
-            time.sleep(5)
+        fail_count += 1
+        endpoint_idx += 1
+        wait = min(10 + fail_count * 5, 60)
+        print(f"Waiting {wait}s before retry - Cloudflare 520 protection", flush=True)
+        time.sleep(wait)
 
 if __name__ == "__main__":
-    # FIX: Run Deriv in background thread, Flask in main thread
     threading.Thread(target=run_deriv, daemon=True).start()
     run_web()
